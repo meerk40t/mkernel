@@ -25,7 +25,7 @@ from .module import Module
 from .service import Service
 from .settings import Settings
 
-KERNEL_VERSION = "0.1.0"
+KERNEL_VERSION = "0.2.0"
 
 RE_ACTIVE = re.compile("service/(.*)/active")
 RE_AVAILABLE = re.compile("service/(.*)/available")
@@ -1118,8 +1118,11 @@ class Kernel(Settings):
         if print not in self._console_channel.watchers:
             print(*args, **kwargs)
 
-    def __call__(self):
-        self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_POSTMAIN)
+    def __call__(self, partial=False):
+        if partial:
+            self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_POSTMAIN)
+        else:
+            self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_SHUTDOWN)
 
     def precli(self):
         pass
@@ -1200,6 +1203,8 @@ class Kernel(Settings):
                     line = line.strip()
                     if line in ("quit", "shutdown", "restart"):
                         self._quit = True
+                        if line == "restart":
+                            self._restart = True
                         break
                     self.console(f".{line}\n")
                     if line == "gui":
@@ -1213,9 +1218,7 @@ class Kernel(Settings):
             self.channel("console").unwatch(self.__print_delegate)
 
     def postmain(self):
-        if self._quit:
-            self._shutdown = True
-            self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_SHUTDOWN)
+        pass
 
     def preshutdown(self):
         channel = self.channel("shutdown")
@@ -1297,7 +1300,7 @@ class Kernel(Settings):
                         channel(_("Suspended Command: {c}").format(c=c))
 
         # pylint: disable=method-hidden
-        self.console = console  # redefine console signal, hidden by design
+        self.console = console  # redefine console function, hidden by design
 
         self.process_queue()  # Process last events.
 
@@ -3354,20 +3357,23 @@ class Kernel(Settings):
             ("quit", "shutdown"), help=_("shuts down all processes and exits")
         )
         def shutdown(**kwargs):
-            if self._shutdown:
-                return
+            """
+            Calls full shutdown of kernel. This is expected to be executed of booted with partial lifecycle.
+
+            @param kwargs:
+            @return:
+            """
             self._shutdown = True
-            self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_SHUTDOWN)
+            self()
 
         @self.console_command(
             "restart", help=_("shuts down all processes, exits and restarts meerk40t")
         )
         def restart(**kwargs):
+            self.restart = True
             if self._shutdown:
                 return
-            self._shutdown = True
-            self.restart = True
-            self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_SHUTDOWN)
+            self.console("quit\n")
 
         # ==========
         # FILE MANAGER
