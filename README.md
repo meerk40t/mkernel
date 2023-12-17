@@ -64,6 +64,8 @@ These are in order:
 
 All registered plugins call `def plugin(kernel, lifecycle)` this is called with the kernel object and the current lifecycle. This is done for each lifecycle event. Plugins are required to use these to register and execute themselves at the appropriate times within the overall program's lifecycle. The primary reason for many of these events are that sometimes code execution requires that other registrations and code has executed before the code being provided. If they are registered at the correct lifecycle event, that guarantee is met. For example, if you need to execute a console command this should be done after `register` since all console commands should be registered during that lifecycle event.
 
+The kernel lifecycle is started by the `__call__()` namely `kernel()`. This will by default process the entire life cycle from `preregister` to `shutdown` the expectation is that something around `mainloop` like a gui or console will catch the thread and hold it there until a custom `quit` command is executed. However, there is also a `kernel(partial=True)` which will only execute part of the lifecycle and exit out of the function with a fully booted ecosystem. You are expected to issue a `kernel()` command to complete the lifecycle or allow some method to call `quit` internally to perform this, a GUI would be expected to capture and use the thread at the `mainloop` and console would do this accordingly. It depends on the current usecase.
+
 
 ```python 
 def plugin(kernel, lifecycle):

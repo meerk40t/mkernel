@@ -25,7 +25,7 @@ from .module import Module
 from .service import Service
 from .settings import Settings
 
-KERNEL_VERSION = "0.1.0"
+KERNEL_VERSION = "0.2.0"
 
 RE_ACTIVE = re.compile("service/(.*)/active")
 RE_AVAILABLE = re.compile("service/(.*)/available")
@@ -74,6 +74,7 @@ class Kernel(Settings):
         ansi: bool = True,
         ignore_settings: bool = False,
         delay: float = 0.05,  # 20 ticks per second
+        language: str = None,
     ):
         """
         Initialize the Kernel. This sets core attributes of the ecosystem that are accessible to all modules.
@@ -128,7 +129,11 @@ class Kernel(Settings):
         self._lookup_lock = threading.Lock()
 
         # The translation object to be overridden by any valid translation functions
-        self.translation = lambda e: e
+        from . import _
+
+        self.translation = _
+        if language is not None:
+            self.set_language(language)
 
         # The function used to process the signals. This is useful if signals should be kept to a single thread.
         self.scheduler_handles_main_thread_jobs = True
@@ -143,13 +148,14 @@ class Kernel(Settings):
         # Signal Listener
         self.signal_job = None
         self.listeners = {}
+        self._add_lock = threading.Lock()
         self._adding_listeners = []
+        self._remove_lock = threading.Lock()
         self._removing_listeners = []
         self._last_message = {}
-        self._signal_lock = threading.Lock()
-        self._add_lock = threading.Lock()
-        self._remove_lock = threading.Lock()
+        self._message_queue_lock = threading.Lock()
         self._message_queue = {}
+        self._process_lock = threading.Lock()
         self._processing = {}
 
         # Channels
@@ -169,7 +175,12 @@ class Kernel(Settings):
         self.args = None
 
     def __str__(self):
-        return "Kernel()"
+        return f"Kernel({self.name}, {self.profile}, {self.version})"
+
+    def set_language(self, language, localedir="locale"):
+        from . import set_language
+
+        set_language(self.name, localedir=localedir, language=language)
 
     def open_safe(self, filename, *args):
         """
@@ -1107,8 +1118,11 @@ class Kernel(Settings):
         if print not in self._console_channel.watchers:
             print(*args, **kwargs)
 
-    def __call__(self):
-        self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_POSTMAIN)
+    def __call__(self, partial=False):
+        if partial:
+            self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_POSTMAIN)
+        else:
+            self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_SHUTDOWN)
 
     def precli(self):
         pass
@@ -1189,6 +1203,8 @@ class Kernel(Settings):
                     line = line.strip()
                     if line in ("quit", "shutdown", "restart"):
                         self._quit = True
+                        if line == "restart":
+                            self._restart = True
                         break
                     self.console(f".{line}\n")
                     if line == "gui":
@@ -1202,9 +1218,7 @@ class Kernel(Settings):
             self.channel("console").unwatch(self.__print_delegate)
 
     def postmain(self):
-        if self._quit:
-            self._shutdown = True
-            self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_SHUTDOWN)
+        pass
 
     def preshutdown(self):
         channel = self.channel("shutdown")
@@ -1286,7 +1300,7 @@ class Kernel(Settings):
                         channel(_("Suspended Command: {c}").format(c=c))
 
         # pylint: disable=method-hidden
-        self.console = console  # redefine console signal, hidden by design
+        self.console = console  # redefine console function, hidden by design
 
         self.process_queue()  # Process last events.
 
@@ -1949,67 +1963,82 @@ class Kernel(Settings):
         """
         Signals add the latest message to the message queue.
 
+        This merely writes the signal to the signal queue.
+
         @param code: Signal code
         @param path: Path of signal
         @param message: Message to send.
         """
-        with self._signal_lock:
+        with self._message_queue_lock:
             self._message_queue[code] = path, message
 
     def _process_add_listeners(self):
-        # Process any adding listeners.
+        """
+        Any add listeners are applied to update listeners.
+        Process any adding listeners.
+        @return:
+        """
         if not self._adding_listeners:
             return
         with self._add_lock:
             add = self._adding_listeners
             self._adding_listeners = []
+        if not add:
+            return
 
-        if add is not None:
-            for signal, funct, lso in add:
-                if signal in self.listeners:
-                    listeners = self.listeners[signal]
-                    listeners.append((funct, lso))
-                else:
-                    self.listeners[signal] = [(funct, lso)]
-                if signal in self._last_message:
-                    origin, message = self._last_message[signal]
-                    funct(origin, *message)
+        for signal, funct, lso in add:
+            if signal in self.listeners:
+                listeners = self.listeners[signal]
+                listeners.append((funct, lso))
+            else:
+                self.listeners[signal] = [(funct, lso)]
+            if signal in self._last_message:
+                origin, message = self._last_message[signal]
+                funct(origin, *message)
 
     def _process_remove_listeners(self):
-        # Process any removing listeners.
+        """
+        Any remove listeners are used to update the current listeners.
+        Process any removing listeners.
+        @return:
+        """
         if not self._removing_listeners:
             return
         with self._remove_lock:
             remove = self._removing_listeners
             self._removing_listeners = []
+        if not remove:
+            return
+        for signal, remove_funct, remove_lso in remove:
+            if signal in self.listeners:
+                listeners = self.listeners[signal]
+                removed = False
+                for i, listen in enumerate(listeners):
+                    listen_funct, listen_lso = listen
+                    if (listen_funct == remove_funct or remove_funct is None) and (
+                        listen_lso is remove_lso or remove_lso is None
+                    ):
+                        del listeners[i]
+                        removed = True
+                        break
+                if not removed:
+                    # This occurs if we attempt to remove a listener which does not exist.
+                    # This is not a useless error but rather a symptom of another bug.
+                    # This should not occur, if it does, something is desynced attempting
+                    # to double remove. Which could also mean listeners are stuck listening
+                    # to places they should not which can cause other errors.
+                    print(
+                        f"Error in {signal}, no {str(remove_funct)} matching {str(remove_lso)}"
+                    )
+                    for index, listener in enumerate(listeners):
+                        print(f"{index}: {str(listener)}")
 
-        if remove is not None:
-            for signal, remove_funct, remove_lso in remove:
-                if signal in self.listeners:
-                    listeners = self.listeners[signal]
-                    removed = False
-                    for i, listen in enumerate(listeners):
-                        listen_funct, listen_lso = listen
-                        if (listen_funct == remove_funct or remove_funct is None) and (
-                            listen_lso is remove_lso or remove_lso is None
-                        ):
-                            del listeners[i]
-                            removed = True
-                            break
-                    if not removed:
-                        # This occurs if we attempt to remove a listener which does not exist.
-                        # This is not a useless error but rather a symptom of another bug.
-                        # This should not occur, if it does, something is desynced attempting
-                        # to double remove. Which could also mean listeners are stuck listening
-                        # to places they should not which can cause other errors.
-                        print(
-                            f"Error in {signal}, no {str(remove_funct)} matching {str(remove_lso)}"
-                        )
-                        for index, listener in enumerate(listeners):
-                            print(f"{index}: {str(listener)}")
-
-    def _process_signal_queue(self, queue):
-        # Process signals.
+    def _process_signal_queue(self):
+        """
+        Process signals in the processing queue.
+        @return:
+        """
+        queue = self._processing
         signal_channel = self.channel("signals")
         for signal, payload in queue.items():
             origin, message = payload
@@ -2026,8 +2055,6 @@ class Kernel(Settings):
 
     def process_queue(self, *args) -> None:
         """
-        Performed in the run_later thread. Signal groups. Threadsafe.
-
         Process the signals queued up. Inserting any attaching listeners, removing any removing listeners. And
         providing the newly attached listeners the last message known from that signal.
         @param args: None
@@ -2039,16 +2066,14 @@ class Kernel(Settings):
             and len(self._removing_listeners) == 0
         ):
             return
-        with self._signal_lock:
-            self._message_queue, self._processing = (
-                self._processing,
-                self._message_queue,
-            )
-        self._process_add_listeners()
-        self._process_remove_listeners()
-
-        self._process_signal_queue(self._processing)
-        self._processing.clear()
+        with self._process_lock:
+            with self._message_queue_lock:
+                self._processing.update(self._message_queue)
+                self._message_queue.clear()
+            self._process_add_listeners()
+            self._process_remove_listeners()
+            self._process_signal_queue()
+            self._processing.clear()
 
     def last_signal(self, signal: str) -> Optional[Tuple]:
         """
@@ -2135,18 +2160,17 @@ class Kernel(Settings):
         @param cookie: cookie used to bind this listener.
         @return:
         """
-        with self._signal_lock:
-            with self._remove_lock:
-                for signal in self.listeners:
-                    listens = self.listeners[signal]
-                    for listener, lso in listens:
-                        if lso is cookie:
-                            self._removing_listeners.append((signal, listener, cookie))
-            with self._add_lock:
-                for i in range(len(self._adding_listeners) - 1, -1, -1):
-                    sl, func, lso = self._adding_listeners[i]
+        with self._remove_lock:
+            for signal in self.listeners:
+                listens = self.listeners[signal]
+                for listener, lso in listens:
                     if lso is cookie:
-                        del self._adding_listeners[i]
+                        self._removing_listeners.append((signal, listener, cookie))
+        with self._add_lock:
+            for i in range(len(self._adding_listeners) - 1, -1, -1):
+                sl, func, lso = self._adding_listeners[i]
+                if lso is cookie:
+                    del self._adding_listeners[i]
 
         # if len(self._removing_listeners) != len(set(self._removing_listeners)):
         #     print("Warning duplicate listener removing.")
@@ -2579,6 +2603,9 @@ class Kernel(Settings):
         @self.console_option(
             "gui", "g", action="store_true", help=_("Run this timer in the gui-thread")
         )
+        @self.console_option(
+            "quiet", "q", action="store_true", help=_("Quiet timer notifications")
+        )
         @self.console_argument(
             "times", help=_("Number of times this timer should execute.")
         )
@@ -2602,6 +2629,7 @@ class Kernel(Settings):
             duration=None,
             off=False,
             gui=False,
+            quiet=False,
             remainder=None,
             **kwargs,
         ):
@@ -2642,21 +2670,38 @@ class Kernel(Settings):
                 channel(_("----------"))
                 return
             if off:
-                if name == "*":
-                    for job_name in [j for j in self.jobs if j.startswith("timer")]:
-                        # removing jobs, must create current list
+                if "*" in name or "?" in name:
+                    # Multi cancel.
+                    name = name.replace("?", ".")
+                    name = name.replace("*", ".*")
+                    skipped = False
+                    canceled = False
+                    for job_name in list(self.jobs):
+                        if not job_name.startswith("timer"):
+                            continue
+                        timer_name = job_name[5:]
+                        if not re.match(name, timer_name):
+                            skipped = True
+                            continue
+                        canceled = True
                         job = self.jobs[job_name]
                         job.cancel()
                         self.unschedule(job)
-                    channel(_("All timers canceled."))
+                    if not quiet and not skipped and canceled:
+                        channel(_("All timers canceled."))
+                    if not quiet and skipped and not canceled:
+                        channel(_("No timers canceled."))
+
                     return
                 try:
                     obj = self.jobs[command]
                     obj.cancel()
                     self.unschedule(obj)
-                    channel(_("Timer '{name}' canceled.").format(name=name))
+                    if not quiet:
+                        channel(_("Timer '{name}' canceled.").format(name=name))
                 except KeyError:
-                    channel(_("Timer '{name}' does not exist.").format(name=name))
+                    if not quiet:
+                        channel(_("Timer '{name}' does not exist.").format(name=name))
                 return
             try:
                 times = int(times)
@@ -3333,20 +3378,23 @@ class Kernel(Settings):
             ("quit", "shutdown"), help=_("shuts down all processes and exits")
         )
         def shutdown(**kwargs):
-            if self._shutdown:
-                return
+            """
+            Calls full shutdown of kernel. This is expected to be executed of booted with partial lifecycle.
+
+            @param kwargs:
+            @return:
+            """
             self._shutdown = True
-            self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_SHUTDOWN)
+            self()
 
         @self.console_command(
             "restart", help=_("shuts down all processes, exits and restarts meerk40t")
         )
         def restart(**kwargs):
+            self.restart = True
             if self._shutdown:
                 return
-            self._shutdown = True
-            self.restart = True
-            self.set_kernel_lifecycle(self, LIFECYCLE_KERNEL_SHUTDOWN)
+            self.console("quit\n")
 
         # ==========
         # FILE MANAGER
